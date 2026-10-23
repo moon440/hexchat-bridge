@@ -1,0 +1,498 @@
+﻿-- hexchat-bridge.lua - part of hexchat-bridge, the HexChat agent control bridge
+-- Copyright (C) 2026 moon440
+--
+-- This program is free software: you can redistribute it and/or modify
+-- it under the terms of the GNU Affero General Public License as published
+-- by the Free Software Foundation, either version 3 of the License, or
+-- (at your option) any later version.
+--
+-- This program is distributed in the hope that it will be useful,
+-- but WITHOUT ANY WARRANTY; without even the implied warranty of
+-- MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+-- GNU Affero General Public License for more details.
+--
+-- You should have received a copy of the GNU Affero General Public License
+-- along with this program.  If not, see <https://www.gnu.org/licenses/>.
+--
+
+
+-- hexchat-bridge -- HexChat file-RPC bridge for external AI agents (OpenCode)
+-- Install: %APPDATA%\HexChat\addons\hexchat-bridge.lua
+-- Protocol: client writes cmd.lua (Lua chunk returning {id,method,args}),
+--           bridge executes, writes resp.json, heartbeats status.json,
+--           logs all traffic to events.jsonl + in-memory ring.
+-- Boot diagnostics: <configdir>\hexchat-bridge-boot.log
+
+-- Boot breadcrumb first, before anything can fail
+local bootpath = nil
+pcall(function()
+  local appdata = os.getenv("APPDATA")
+  if appdata then bootpath = appdata .. "\\HexChat\\hexchat-bridge-boot.log" end
+end)
+
+local function boot(msg)
+  if not bootpath then return end
+  local ok, f = pcall(io.open, bootpath, "a")
+  if ok and f then
+    local t = 0
+    pcall(function() t = os.time() end)
+    f:write(tostring(t) .. " " .. tostring(msg) .. "\n")
+    f:close()
+  end
+end
+boot("chunk start")
+
+hexchat.register("hexchat-bridge", "2.0", "OpenCode agent control bridge (file RPC + event log)")
+
+local configdir = nil
+pcall(function() configdir = hexchat.get_info("configdir") end)
+if not configdir or configdir == "" then
+  configdir = (os.getenv("APPDATA") or ".") .. "\\HexChat"
+end
+if string.sub(configdir, -1) == "\\" then configdir = string.sub(configdir, 1, -2) end
+local bridge_dir = configdir .. "\\hexchat-bridge\\"
+boot("configdir=" .. tostring(configdir))
+
+local ok, err = pcall(function()
+
+----------------------------------------------------------------------
+-- JSON encoder
+----------------------------------------------------------------------
+local function enc_str(s)
+  s = tostring(s)
+  s = s:gsub("\\", "\\\\"):gsub('"', '\\"'):gsub("\n", "\\n"):gsub("\r", "\\r"):gsub("\t", "\\t")
+  s = s:gsub("%c", function(c) return string.format("\\u%04x", c:byte()) end)
+  return '"' .. s .. '"'
+end
+
+local function is_array(t)
+  local n = 0
+  for k, v in pairs(t) do
+    if type(k) ~= "number" or k ~= math.floor(k) or k < 1 then return false end
+    n = n + 1
+  end
+  if n == 0 then return false end
+  for i = 1, n do if t[i] == nil then return false end end
+  return true
+end
+
+local enc
+function enc(v)
+  if v == nil then return "null" end
+  local tv = type(v)
+  if tv == "string" then return enc_str(v) end
+  if tv == "number" then
+    if v == math.floor(v) and math.abs(v) < 1e15 then return string.format("%d", v)
+    else return string.format("%.10g", v) end
+  end
+  if tv == "boolean" then return tostring(v) end
+  if tv == "table" then
+    if is_array(v) then
+      local parts = {}
+      for i = 1, #v do parts[i] = enc(v[i]) end
+      return "[" .. table.concat(parts, ",") .. "]"
+    else
+      local parts = {}
+      for k, vv in pairs(v) do parts[#parts + 1] = enc_str(k) .. ":" .. enc(vv) end
+      return "{" .. table.concat(parts, ",") .. "}"
+    end
+  end
+  return "null"
+end
+
+----------------------------------------------------------------------
+-- events ring + jsonl log
+----------------------------------------------------------------------
+local events = {}
+local ev_n = 0
+local EV_MAX = 2000
+
+local function record(e)
+  ev_n = ev_n + 1
+  events[ev_n] = e
+  if ev_n > EV_MAX then table.remove(events, 1); ev_n = EV_MAX end
+  local ok2, f = pcall(io.open, bridge_dir .. "events.jsonl", "a")
+  if ok2 and f then f:write(enc(e) .. "\n"); f:close() end
+end
+
+local function bit_band(a, b)
+  local bit = nil
+  pcall(function() bit = require("bit") end)
+  if bit then return bit.band(a, b) end
+  -- fallback for plain lua 5.1
+  return math.floor(a / 2^math.floor(math.log(b, 2))) % 2 * b
+end
+
+----------------------------------------------------------------------
+-- raw server line capture (ALL inbound traffic)
+----------------------------------------------------------------------
+local logged_shape = false
+
+local function parse_raw(raw)
+  local from = string.match(raw, "^:([^ !]+)") or ""
+  local rest = string.match(raw, "^:%S+ (.*)$") or raw
+  local ev = string.upper(string.match(rest, "^(%a+)") or string.match(rest, "^(%d%d%d)") or "LINE")
+  local target = string.match(rest, "^%a+ (%S+)") or string.match(rest, "^%d%d%d %S+ (%S+)") or ""
+  local text = string.match(rest, ":([^:]*)$") or ""
+  if text == "" then text = string.match(rest, "^[^:]+$") or "" end
+  return from, ev, target, text
+end
+
+hexchat.hook_server(nil, function(word, word_eol)
+  local raw = ""
+  pcall(function()
+    raw = word_eol[0] or word[0] or word_eol[1] or word[1] or ""
+  end)
+  if not logged_shape then
+    logged_shape = true
+    boot("server hook shape ok, sample=" .. string.sub(raw, 1, 60))
+  end
+  if raw == "" then return end
+  local from, ev, target, text = parse_raw(raw)
+  local c = {}
+  pcall(function() c = hexchat.get_context() or c end)
+  local kind = "server"
+  if ev == "PRIVMSG" then
+    if string.sub(target, 1, 1) == "#" or string.sub(target, 1, 1) == "&" then kind = "recv"
+    else kind = "query" end
+  elseif ev == "NOTICE" then kind = "notice"
+  elseif ev == "JOIN" then kind = "join"; text = target; target = from
+  elseif ev == "PART" then kind = "part"
+  elseif ev == "QUIT" then kind = "quit"
+  elseif ev == "NICK" then kind = "nick"
+  end
+  record({
+    t = os.time(), kind = kind, ev = ev,
+    network = c.network or "", channel = target,
+    from = from, text = text,
+  })
+end)
+
+-- outgoing messages typed in tabs
+local function sent_hook(label)
+  pcall(function()
+    hexchat.hook_print(label, function(word)
+      local c = {}
+      pcall(function() c = hexchat.get_context() or c end)
+      record({
+        t = os.time(), kind = "sent", ev = label,
+        network = c.network or "", channel = c.channel or "",
+        nick = c.nick or "", text = word[1] or "",
+      })
+    end)
+  end)
+end
+sent_hook("Msg Send")
+sent_hook("Private Message to Dialog Sent")
+
+----------------------------------------------------------------------
+-- helpers
+----------------------------------------------------------------------
+local function run_in(a, cmdtext)
+  -- execute cmdtext in the context of a.server/a.channel if given, else current
+  if a and (a.server or a.channel) then
+    local ctx = nil
+    pcall(function() ctx = hexchat.find_context(a.server, a.channel) end)
+    if ctx then
+      local ok2 = pcall(function() ctx:command(cmdtext) end)
+      if ok2 then return true end
+    end
+  end
+  hexchat.command(cmdtext)
+  return true
+end
+
+local function escape_arg(s)
+  -- minimal guard against command injection into /exec-like parsing
+  return (string.gsub(s, "[\r\n]", " "))
+end
+
+----------------------------------------------------------------------
+-- servlist helpers (this build has no /CONNECT or /OPEN; use /SERVER)
+----------------------------------------------------------------------
+local function parse_servlist()
+  local out = {}
+  local ok2, f = pcall(io.open, configdir .. "\\servlist.conf", "r")
+  if not ok2 or not f then return out end
+  local cur = nil
+  for line in f:lines() do
+    local n = string.match(line, "^N=(.*)")
+    local s = string.match(line, "^S=(.*)")
+    if n then
+      cur = { network = n, servers = {} }
+      out[#out + 1] = cur
+    elseif s and cur then
+      cur.servers[#cur.servers + 1] = s
+    end
+  end
+  f:close()
+  return out
+end
+
+local function find_server(network)
+  local list = parse_servlist()
+  for i = 1, #list do
+    if string.lower(list[i].network) == string.lower(network) and #list[i].servers > 0 then
+      return list[i].servers[1]
+    end
+  end
+  return nil
+end
+
+----------------------------------------------------------------------
+-- methods
+----------------------------------------------------------------------
+local M = {}
+
+function M.ping(a)
+  return { version = hexchat.get_info("version"), dir = bridge_dir }
+end
+
+function M.status(a)
+  local out = { connected = false, networks = {}, channels = {}, nick = hexchat.get_info("nick") or "" }
+  pcall(function()
+    for ch in hexchat.iterate("channels") do
+      local flags = ch.flags or 0
+      local is_conn = bit_band(flags, 1) == 1
+      local is_conn2 = bit_band(flags, 2) == 1 -- connecting
+      out.channels[#out.channels + 1] = {
+        network = ch.network or "", server = ch.server or "",
+        channel = ch.channel or "", type = ch.type or 0,
+        users = ch.users or 0, lag = ch.lag or 0,
+        connected = is_conn, connecting = is_conn2,
+      }
+      if is_conn then out.connected = true end
+    end
+  end)
+  local seen = {}
+  local nets = {}
+  for i = 1, #out.channels do
+    local n = out.channels[i].network
+    if n and n ~= "" and not seen[n] then seen[n] = true; nets[#nets + 1] = n end
+  end
+  out.networks = nets
+  return out
+end
+
+function M.servlist(a)
+  return parse_servlist()
+end
+
+function M.buffers(a)
+  local out = {}
+  pcall(function()
+    for ch in hexchat.iterate("channels") do
+      out[#out + 1] = {
+        network = ch.network or "", server = ch.server or "",
+        channel = ch.channel or "", type = ch.type or 0,
+        users = ch.users or 0, flags = ch.flags or 0,
+      }
+    end
+  end)
+  return out
+end
+
+function M.users(a)
+  if not a or not a.channel then error("users needs args.channel") end
+  local out = {}
+  local ctx = nil
+  pcall(function() ctx = hexchat.find_context(a.server, a.channel) end)
+  if not ctx then return { error = "channel not found" } end
+  pcall(function()
+    for u in ctx:iterate("users") do
+      out[#out + 1] = { nick = u.nick or "", prefix = u.prefix or "", host = u.host or "", away = u.away or "", realname = u.realname or "" }
+    end
+  end)
+  return out
+end
+
+function M.connect(a)
+  if a and a.address and a.address ~= "" then
+    hexchat.command("SERVER " .. escape_arg(a.address) .. (a.port and (" " .. tostring(a.port)) or "") .. (a.channel and (" " .. escape_arg(a.channel)) or ""))
+  elseif a and a.network and a.network ~= "" then
+    local addr = find_server(a.network)
+    if not addr then error("network not found in servlist: " .. a.network) end
+    hexchat.command("SERVER " .. escape_arg(addr) .. (a.channel and (" " .. escape_arg(a.channel)) or ""))
+  else
+    hexchat.command("SCONNECT")
+  end
+  return { sent = true }
+end
+
+function M.disconnect(a)
+  if a and a.network then
+    local ctx = nil
+    pcall(function() ctx = hexchat.find_context(a.network, nil) end)
+    if ctx then hexchat.set_context(ctx) end
+  end
+  hexchat.command("DISCONNECT")
+  return { sent = true }
+end
+
+function M.open(a)
+  if not a or not a.channel then error("open needs args.channel") end
+  if a.network and a.network ~= "" then
+    local addr = find_server(a.network)
+    if not addr then error("network not found in servlist: " .. a.network) end
+    hexchat.command("SERVER " .. escape_arg(addr) .. " " .. escape_arg(a.channel))
+  else
+    hexchat.command("SERVER " .. escape_arg(a.server or "") .. " " .. escape_arg(a.channel))
+  end
+  return { sent = true }
+end
+
+function M.close(a)
+  if a and a.channel then
+    local done = false
+    pcall(function()
+      for ch in hexchat.iterate("channels") do
+        if ch.channel == a.channel then
+          local ctx = ch.context
+          if ctx then hexchat.set_context(ctx); hexchat.command("CLOSE"); done = true end
+        end
+      end
+    end)
+    return { closed = done }
+  end
+  hexchat.command("CLOSE")
+  return { sent = true }
+end
+
+function M.join(a)
+  if not a or not a.channel then error("join needs args.channel") end
+  local joined_ctx = false
+  if a.network and a.network ~= "" then
+    local ctx = nil
+    pcall(function() ctx = hexchat.find_context(a.network, nil) end)
+    if ctx then
+      pcall(function() ctx:command("JOIN " .. escape_arg(a.channel) .. (a.key and (" " .. escape_arg(a.key)) or "")) end)
+      joined_ctx = true
+    else
+      local addr = find_server(a.network)
+      if not addr then error("network not found in servlist: " .. a.network) end
+      hexchat.command("SERVER " .. escape_arg(addr) .. " " .. escape_arg(a.channel))
+    end
+  else
+    local cmd = "JOIN " .. escape_arg(a.channel) .. (a.key and (" " .. escape_arg(a.key)) or "")
+    run_in({ server = a.server }, cmd)
+  end
+  if a.nickserv and a.password and a.password ~= "" then
+    run_in({ server = a.network or a.server }, "MSG NickServ +p IDENTIFY " .. escape_arg(a.password))
+  end
+  return { sent = true, used_existing_context = joined_ctx }
+end
+
+function M.part(a)
+  if not a or not a.channel then error("part needs args.channel") end
+  run_in({ server = a.server, channel = a.channel }, "PART " .. escape_arg(a.channel) .. (a.message and (" :" .. escape_arg(a.message)) or ""))
+  return { sent = true }
+end
+
+function M.say(a)
+  if not a or not a.channel or a.text == nil then error("say needs args.channel and args.text") end
+  run_in({ server = a.server, channel = a.channel }, "MSG " .. escape_arg(a.channel) .. " " .. escape_arg(a.text))
+  return { sent = true }
+end
+
+M.msg = M.say
+
+function M.command(a)
+  if not a or not a.cmd then error("command needs args.cmd") end
+  run_in(a, escape_arg(a.cmd))
+  return { sent = true }
+end
+
+M.raw = M.command
+
+function M.nick(a)
+  if not a or not a.nick then error("nick needs args.nick") end
+  hexchat.command("NICK " .. escape_arg(a.nick))
+  return { sent = true }
+end
+
+function M.topic(a)
+  if not a or not a.channel then error("topic needs args.channel") end
+  if a.text then run_in({ server = a.server, channel = a.channel }, "TOPIC " .. escape_arg(a.channel) .. " :?" .. " " .. escape_arg(a.text))
+  else
+    local ctx = nil
+    pcall(function() ctx = hexchat.find_context(a.server, a.channel) end)
+    if ctx then return { topic = ctx:get_info("topic") or "" } end
+    return { topic = hexchat.get_info("topic") or "" }
+  end
+  return { sent = true }
+end
+
+function M.history(a)
+  local limit = (a and tonumber(a.limit)) or 200
+  local chan = a and a.channel
+  local kind = a and a.kind
+  local out = {}
+  for i = 1, ev_n do
+    local e = events[i]
+    local keep = true
+    if chan and (e.channel or "") ~= chan then keep = false end
+    if kind and (e.kind or "") ~= kind then keep = false end
+    if keep then out[#out + 1] = e end
+  end
+  while #out > limit do table.remove(out, 1) end
+  return out
+end
+
+function M.clear_history(a)
+  events = {}; ev_n = 0
+  local ok2, f = pcall(io.open, bridge_dir .. "events.jsonl", "w")
+  if ok2 and f then f:close() end
+  return { cleared = true }
+end
+
+----------------------------------------------------------------------
+-- poll loop
+----------------------------------------------------------------------
+local last_id = nil
+
+local function poll()
+  local ok1, sf = pcall(io.open, bridge_dir .. "status.json", "w")
+  if ok1 and sf then sf:write('{"last_poll":' .. tostring(os.time()) .. ',"bridge":"hexchat-bridge"}'); sf:close() end
+
+  local ok2, f = pcall(io.open, bridge_dir .. "cmd.lua", "r")
+  if ok2 and f then
+    local data = f:read("*a")
+    f:close()
+    os.remove(bridge_dir .. "cmd.lua")
+    local chunk = data and loadstring(data)
+    if chunk then
+      local ok3, cmd = pcall(chunk)
+      if ok3 and type(cmd) == "table" and cmd.id and cmd.id ~= last_id then
+        last_id = cmd.id
+        local fn = M[cmd.method]
+        local rerr, res = nil, nil
+        if not fn then
+          rerr = "unknown method: " .. tostring(cmd.method)
+        else
+          local ok4, r2 = pcall(fn, cmd.args or {})
+          if ok4 then res = r2 else rerr = tostring(r2) end
+        end
+        local out
+        if rerr then
+          out = '{"id":' .. enc_str(cmd.id) .. ',"ok":false,"error":' .. enc_str(rerr) .. '}'
+        else
+          out = '{"id":' .. enc_str(cmd.id) .. ',"ok":true,"result":' .. enc(res) .. '}'
+        end
+        local ok5, rf = pcall(io.open, bridge_dir .. "resp.json", "w")
+        if ok5 and rf then rf:write(out); rf:close() end
+      end
+    end
+  end
+  return true
+end
+
+hexchat.hook_timer(200, poll)
+record({ t = os.time(), kind = "system", text = "hexchat-bridge v2 loaded dir=" .. bridge_dir })
+boot("hexchat-bridge v2 main() complete")
+
+end)
+
+if not ok then
+  boot("LOAD ERROR: " .. tostring(err))
+end
+

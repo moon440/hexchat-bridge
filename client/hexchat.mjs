@@ -1,0 +1,126 @@
+﻿/* * hexchat.mjs - part of hexchat-bridge, the HexChat agent control bridge
+ * Copyright (C) 2026 moon440
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published
+ * by the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ *
+ */
+// hexchat.mjs -- CLI client for the HexChat hexchat-bridge (Lua plugin bridge).
+// Usage:
+//   node hexchat.mjs <method> ['{"json":"args"}']   e.g. node hexchat.mjs join '{"channel":"#x","network":"Libera"}'
+//   node hexchat.mjs health                         bridge heartbeat freshness
+//   node hexchat.mjs events [limit] [channel]       tail captured chat log (works offline, reads file)
+// Methods: ping status servlist buffers connect disconnect open close join part say msg
+//          command raw nick topic history clear_history
+import fs from "node:fs/promises";
+import path from "node:path";
+import os from "node:os";
+
+const APPDATA = process.env.APPDATA || path.join(os.homedir(), "AppData", "Roaming");
+const DIR = path.join(APPDATA, "HexChat", "hexchat-bridge");
+const CMD = path.join(DIR, "cmd.lua");
+const RESP = path.join(DIR, "resp.json");
+const STATUS = path.join(DIR, "status.json");
+const EVENTS = path.join(DIR, "events.jsonl");
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function luaVal(v) {
+  if (v === null || v === undefined) return "nil";
+  if (typeof v === "number" || typeof v === "boolean") return String(v);
+  if (typeof v === "string") {
+    let s = v.replace(/\\/g, "\\\\").replace(/"/g, '\\"')
+      .replace(/\n/g, "\\n").replace(/\r/g, "\\r").replace(/\t/g, "\\t");
+    s = s.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, (c) => "\\" + c.charCodeAt(0));
+    return '"' + s + '"';
+  }
+  if (Array.isArray(v)) return "{" + v.map(luaVal).join(",") + "}";
+  if (typeof v === "object") {
+    const parts = Object.entries(v).filter(([, x]) => x !== undefined)
+      .map(([k, x]) => luaKey(k) + " = " + luaVal(x));
+    return "{" + parts.join(", ") + "}";
+  }
+  return "nil";
+}
+const luaKey = (k) => (/^[A-Za-z_][A-Za-z0-9_]*$/.test(k) ? k : "[" + luaVal(k) + "]");
+
+async function ensureDir() { await fs.mkdir(DIR, { recursive: true }); }
+
+export async function call(method, args = {}, timeoutMs = 15000) {
+  await ensureDir();
+  const id = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+  const chunk = `return { id = ${luaVal(id)}, method = ${luaVal(method)}, args = ${luaVal(args)} }\n`;
+  const tmp = path.join(DIR, "cmd.tmp.lua");
+  await fs.writeFile(tmp, chunk, "utf8");
+  try { await fs.access(CMD); await fs.unlink(CMD); } catch {}
+  await fs.rename(tmp, CMD);
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const j = JSON.parse(await fs.readFile(RESP, "utf8"));
+      if (j.id === id) {
+        if (!j.ok) throw new Error("hexchat bridge error: " + j.error);
+        return j.result;
+      }
+    } catch (e) {
+      if (e instanceof SyntaxError || String(e.message).startsWith("hexchat bridge error")) throw e;
+    }
+    await sleep(120);
+  }
+  throw new Error(`hexchat bridge timeout after ${timeoutMs}ms. Is HexChat running with the hexchat-bridge addon loaded? (Plugins list, or restart HexChat)`);
+}
+
+export async function health() {
+  await ensureDir();
+  try {
+    const st = JSON.parse(await fs.readFile(STATUS, "utf8"));
+    const age = Math.floor(Date.now() / 1000) - st.last_poll;
+    return { alive: age < 6, last_poll: st.last_poll, age_seconds: age };
+  } catch (e) {
+    return { alive: false, error: String(e.message) };
+  }
+}
+
+export async function tailEvents(limit = 50, channel = null) {
+  let raw = "";
+  try { raw = await fs.readFile(EVENTS, "utf8"); } catch { return []; }
+  const lines = raw.split("\n").filter((l) => l.trim());
+  const events = [];
+  for (const l of lines) { try { events.push(JSON.parse(l)); } catch {} }
+  const filtered = channel ? events.filter((e) => e.channel === channel) : events;
+  return filtered.slice(-limit);
+}
+
+// ---- CLI (only when run directly, not when imported) ----
+import { pathToFileURL } from "node:url";
+const isMain = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
+if (isMain) {
+  const [, , method, arg1, arg2] = process.argv;
+  if (!method) {
+    console.log("usage: node hexchat.mjs <method> ['{json}'] | health | events [limit] [channel]");
+    process.exit(0);
+  }
+  try {
+    if (method === "health") {
+      console.log(JSON.stringify(await health(), null, 2));
+    } else if (method === "events") {
+      console.log(JSON.stringify(await tailEvents(parseInt(arg1 || "50"), arg2 || null), null, 2));
+    } else {
+      const args = arg1 ? JSON.parse(arg1) : {};
+      console.log(JSON.stringify(await call(method, args), null, 2));
+    }
+  } catch (e) {
+    console.error(e.message);
+    process.exit(1);
+  }
+}
