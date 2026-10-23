@@ -1,4 +1,4 @@
-﻿-- hexchat-bridge.lua - part of hexchat-bridge, the HexChat agent control bridge
+-- hexchat-bridge.lua - part of hexchat-bridge, the HexChat agent control bridge
 -- Copyright (C) 2026 moon440
 --
 -- This program is free software: you can redistribute it and/or modify
@@ -42,7 +42,7 @@ local function boot(msg)
 end
 boot("chunk start")
 
-hexchat.register("hexchat-bridge", "2.0", "OpenCode agent control bridge (file RPC + event log)")
+hexchat.register("hexchat-bridge", "1.0.1", "HexChat agent control bridge (token-authenticated file RPC + event log)")
 
 local configdir = nil
 pcall(function() configdir = hexchat.get_info("configdir") end)
@@ -56,10 +56,52 @@ boot("configdir=" .. tostring(configdir))
 local ok, err = pcall(function()
 
 ----------------------------------------------------------------------
--- JSON encoder
+-- JSON encoder (UTF-8 safe: invalid bytes are replaced with U+FFFD so
+-- the output is ALWAYS valid JSON, even from hostile/broken servers)
 ----------------------------------------------------------------------
+local REPLACER = "\239\191\189" -- U+FFFD in UTF-8
+
+local function utf8_clean(s)
+  local out = {}
+  local i, n = 1, #s
+  while i <= n do
+    local b = s:byte(i)
+    local len
+    if b < 0x80 then len = 1
+    elseif b >= 0xC2 and b <= 0xDF then len = 2
+    elseif b >= 0xE0 and b <= 0xEF then len = 3
+    elseif b >= 0xF0 and b <= 0xF4 then len = 4
+    else len = 0 end
+    local okseq = len > 0
+    if okseq and len >= 2 then
+      for k = 1, len - 1 do
+        local cb = s:byte(i + k)
+        if not cb or cb < 0x80 or cb > 0xBF then okseq = false break end
+      end
+    end
+    if okseq and len == 3 then -- overlong / surrogate guards
+      local b2 = s:byte(i + 1)
+      if b == 0xE0 and b2 < 0xA0 then okseq = false end
+      if b == 0xED and b2 > 0x9F then okseq = false end
+    end
+    if okseq and len == 4 then
+      local b2 = s:byte(i + 1)
+      if b == 0xF0 and b2 < 0x90 then okseq = false end
+      if b == 0xF4 and b2 > 0x8F then okseq = false end
+    end
+    if okseq then
+      out[#out + 1] = s:sub(i, i + len - 1)
+      i = i + len
+    else
+      out[#out + 1] = REPLACER
+      i = i + 1
+    end
+  end
+  return table.concat(out)
+end
+
 local function enc_str(s)
-  s = tostring(s)
+  s = utf8_clean(tostring(s))
   s = s:gsub("\\", "\\\\"):gsub('"', '\\"'):gsub("\n", "\\n"):gsub("\r", "\\r"):gsub("\t", "\\t")
   s = s:gsub("%c", function(c) return string.format("\\u%04x", c:byte()) end)
   return '"' .. s .. '"'
@@ -107,20 +149,41 @@ local events = {}
 local ev_n = 0
 local EV_MAX = 2000
 
+local ev_written = 0
+
+local function rotate_log()
+  local ok3, wf = pcall(io.open, bridge_dir .. "events.jsonl", "w")
+  if ok3 and wf then
+    for i = 1, ev_n do wf:write(enc(events[i]) .. "\n") end
+    wf:close()
+  end
+  ev_written = ev_n
+end
+
 local function record(e)
   ev_n = ev_n + 1
   events[ev_n] = e
   if ev_n > EV_MAX then table.remove(events, 1); ev_n = EV_MAX end
   local ok2, f = pcall(io.open, bridge_dir .. "events.jsonl", "a")
   if ok2 and f then f:write(enc(e) .. "\n"); f:close() end
+  ev_written = ev_written + 1
+  if ev_written >= EV_MAX * 2 then rotate_log() end -- bound the file to ~ring size
 end
 
+local has_bit = nil
+pcall(function() has_bit = require("bit") end)
+
 local function bit_band(a, b)
-  local bit = nil
-  pcall(function() bit = require("bit") end)
-  if bit then return bit.band(a, b) end
-  -- fallback for plain lua 5.1
-  return math.floor(a / 2^math.floor(math.log(b, 2))) % 2 * b
+  if has_bit then return has_bit.band(a, b) end
+  -- pure-Lua fallback (correct on plain 5.1: no 2-arg math.log there)
+  local r, m = 0, 1
+  a = math.floor(a); b = math.floor(b)
+  while a > 0 and b > 0 do
+    local ra, rb = a % 2, b % 2
+    if ra == 1 and rb == 1 then r = r + m end
+    a = (a - ra) / 2; b = (b - rb) / 2; m = m * 2
+  end
+  return r
 end
 
 ----------------------------------------------------------------------
@@ -135,6 +198,19 @@ local function parse_raw(raw)
   local target = string.match(rest, "^%a+ (%S+)") or string.match(rest, "^%d%d%d %S+ (%S+)") or ""
   local text = string.match(rest, ":([^:]*)$") or ""
   if text == "" then text = string.match(rest, "^[^:]+$") or "" end
+  -- JOIN: trailing ":" form means the target IS the channel
+  if ev == "JOIN" then
+    target = string.gsub(target, "^:", "")
+    text = ""
+  end
+  -- numerics: first argument is usually our own nick; find the real #channel arg
+  if string.match(ev, "^%d%d%d$") then
+    for w in string.gmatch(rest, "%S+") do
+      local c1 = string.sub(w, 1, 1)
+      if c1 == "#" or c1 == "&" then target = w break end
+    end
+    if target == "=" then target = "" end
+  end
   return from, ev, target, text
 end
 
@@ -156,7 +232,7 @@ hexchat.hook_server(nil, function(word, word_eol)
     if string.sub(target, 1, 1) == "#" or string.sub(target, 1, 1) == "&" then kind = "recv"
     else kind = "query" end
   elseif ev == "NOTICE" then kind = "notice"
-  elseif ev == "JOIN" then kind = "join"; text = target; target = from
+  elseif ev == "JOIN" then kind = "join" -- parse_raw already fixed target/text
   elseif ev == "PART" then kind = "part"
   elseif ev == "QUIT" then kind = "quit"
   elseif ev == "NICK" then kind = "nick"
@@ -439,16 +515,26 @@ function M.history(a)
 end
 
 function M.clear_history(a)
-  events = {}; ev_n = 0
+  events = {}; ev_n = 0; ev_written = 0
   local ok2, f = pcall(io.open, bridge_dir .. "events.jsonl", "w")
   if ok2 and f then f:close() end
   return { cleared = true }
 end
 
 ----------------------------------------------------------------------
--- poll loop
+-- poll loop (token-authenticated)
 ----------------------------------------------------------------------
 local last_id = nil
+
+local function read_token()
+  local okf, f = pcall(io.open, bridge_dir .. "token.txt", "r")
+  if not okf or not f then return nil end
+  local t = f:read("*a")
+  f:close()
+  t = (t or ""):gsub("%s+$", "")
+  if t == "" then return nil end
+  return t
+end
 
 local function poll()
   local ok1, sf = pcall(io.open, bridge_dir .. "status.json", "w")
@@ -466,7 +552,12 @@ local function poll()
         last_id = cmd.id
         local fn = M[cmd.method]
         local rerr, res = nil, nil
-        if not fn then
+        local expected = read_token()
+        if not expected then
+          rerr = "token.txt missing in bridge dir - refusing unauthenticated command"
+        elseif cmd.token ~= expected then
+          rerr = "invalid token"
+        elseif not fn then
           rerr = "unknown method: " .. tostring(cmd.method)
         else
           local ok4, r2 = pcall(fn, cmd.args or {})
@@ -487,8 +578,8 @@ local function poll()
 end
 
 hexchat.hook_timer(200, poll)
-record({ t = os.time(), kind = "system", text = "hexchat-bridge v2 loaded dir=" .. bridge_dir })
-boot("hexchat-bridge v2 main() complete")
+record({ t = os.time(), kind = "system", text = "hexchat-bridge 1.0.1 loaded dir=" .. bridge_dir })
+boot("hexchat-bridge 1.0.1 main() complete")
 
 end)
 

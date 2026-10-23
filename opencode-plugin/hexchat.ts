@@ -1,4 +1,4 @@
-﻿/* * hexchat.ts - part of hexchat-bridge, the HexChat agent control bridge
+/* * hexchat.ts - part of hexchat-bridge, the HexChat agent control bridge
  * Copyright (C) 2026 moon440
  *
  * This program is free software: you can redistribute it and/or modify
@@ -30,6 +30,7 @@ const CMD = path.join(DIR, "cmd.lua")
 const RESP = path.join(DIR, "resp.json")
 const STATUS = path.join(DIR, "status.json")
 const EVENTS = path.join(DIR, "events.jsonl")
+const TOKEN = path.join(DIR, "token.txt")
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
@@ -57,33 +58,55 @@ function luaVal(v: any): string {
 }
 const luaKey = (k: string) => (/^[A-Za-z_][A-Za-z0-9_]*$/.test(k) ? k : "[" + luaVal(k) + "]")
 
+async function getToken(): Promise<string> {
+  try {
+    const t = (await fs.readFile(TOKEN, "utf8")).trim()
+    if (t) return t
+  } catch {}
+  const t =
+    "hcb-" + Date.now().toString(36) + "-" +
+    Math.random().toString(36).slice(2, 10) + Math.random().toString(36).slice(2, 10)
+  try {
+    await fs.writeFile(TOKEN, t, "utf8")
+  } catch {}
+  return t
+}
+
 async function bridgeCall(method: string, args: Record<string, any>, signal?: AbortSignal, timeoutMs = 15000) {
   await fs.mkdir(DIR, { recursive: true })
+  const token = await getToken()
   const id = Date.now().toString(36) + Math.random().toString(36).slice(2, 8)
-  const chunk = `return { id = ${luaVal(id)}, method = ${luaVal(method)}, args = ${luaVal(args)} }\n`
-  const tmp = path.join(DIR, "cmd.tmp.lua")
+  const chunk = `return { id = ${luaVal(id)}, token = ${luaVal(token)}, method = ${luaVal(method)}, args = ${luaVal(args)} }\n`
+  const tmp = path.join(DIR, `cmd.${process.pid}.${Date.now()}.tmp.lua`)
   await fs.writeFile(tmp, chunk, "utf8")
-  try {
-    await fs.access(CMD)
-    await fs.unlink(CMD)
-  } catch {}
-  await fs.rename(tmp, CMD)
+  const handoffDeadline = Date.now() + 3000
+  for (;;) {
+    try {
+      await fs.rename(tmp, CMD)
+      break
+    } catch (e: any) {
+      if (e.code !== "EEXIST" && e.code !== "EPERM") throw e
+      if (Date.now() > handoffDeadline) throw new Error("bridge cmd handoff busy")
+      await sleep(80)
+    }
+  }
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
     if (signal?.aborted) throw new Error("hexchat call aborted")
+    let j: any = null
     try {
-      const j = JSON.parse(await fs.readFile(RESP, "utf8"))
-      if (j.id === id) {
-        if (!j.ok) throw new Error("hexchat bridge error: " + j.error)
-        return j.result
-      }
-    } catch (e: any) {
-      if (typeof e?.message === "string" && e.message.startsWith("hexchat bridge error")) throw e
+      j = JSON.parse(await fs.readFile(RESP, "utf8"))
+    } catch {
+      /* torn/partial read, retry */
+    }
+    if (j && j.id === id) {
+      if (!j.ok) throw new Error("hexchat bridge error: " + j.error)
+      return j.result
     }
     await sleep(120)
   }
   throw new Error(
-    `hexchat bridge timeout. HexChat must be running with the hexchat-bridge addon loaded (install: copy tools/hexchat/hexchat-bridge to %APPDATA%\\HexChat\\addons, then restart HexChat).`,
+    `hexchat bridge timeout. HexChat must be running AND connected (the Lua engine only initializes after the first connection) with the hexchat-bridge addon installed.`,
   )
 }
 
@@ -116,7 +139,7 @@ async function tailEvents(limit: number, channel?: string) {
 }
 
 const METHODS = [
-  "health", "ping", "status", "servlist", "buffers",
+  "health", "ping", "status", "servlist", "buffers", "users",
   "connect", "disconnect", "open", "close",
   "join", "part", "say", "command", "nick", "topic",
   "history", "clear_history",

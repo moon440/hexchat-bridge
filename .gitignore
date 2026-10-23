@@ -1,10 +1,11 @@
 # never ship local runtime state or personal HexChat data
 events.jsonl
 cmd.lua
-cmd.tmp.lua
+cmd.*.tmp.lua
 resp.json
 status.json
-ocbridge_boot.log
+token.txt
+hexchat-bridge-boot.log
 servlist.conf
 hexchat.conf
 *.local

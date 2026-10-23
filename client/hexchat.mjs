@@ -1,4 +1,4 @@
-﻿/* * hexchat.mjs - part of hexchat-bridge, the HexChat agent control bridge
+/* * hexchat.mjs - part of hexchat-bridge, the HexChat agent control bridge
  * Copyright (C) 2026 moon440
  *
  * This program is free software: you can redistribute it and/or modify
@@ -32,6 +32,7 @@ const CMD = path.join(DIR, "cmd.lua");
 const RESP = path.join(DIR, "resp.json");
 const STATUS = path.join(DIR, "status.json");
 const EVENTS = path.join(DIR, "events.jsonl");
+const TOKEN = path.join(DIR, "token.txt");
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -56,28 +57,48 @@ const luaKey = (k) => (/^[A-Za-z_][A-Za-z0-9_]*$/.test(k) ? k : "[" + luaVal(k) 
 
 async function ensureDir() { await fs.mkdir(DIR, { recursive: true }); }
 
+// Shared token: first client creates it; bridge refuses commands without it.
+// Threat model: stops other local processes/users from driving the client
+// blindly; NOT protection against malware that can already read your profile.
+async function getToken() {
+  try {
+    const t = (await fs.readFile(TOKEN, "utf8")).trim();
+    if (t) return t;
+  } catch {}
+  const t = "hcb-" + Date.now().toString(36) + "-" +
+    Math.random().toString(36).slice(2, 10) + Math.random().toString(36).slice(2, 10);
+  try { await fs.writeFile(TOKEN, t, "utf8"); } catch {}
+  return t;
+}
+
 export async function call(method, args = {}, timeoutMs = 15000) {
   await ensureDir();
+  const token = await getToken();
   const id = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
-  const chunk = `return { id = ${luaVal(id)}, method = ${luaVal(method)}, args = ${luaVal(args)} }\n`;
-  const tmp = path.join(DIR, "cmd.tmp.lua");
+  const chunk = `return { id = ${luaVal(id)}, token = ${luaVal(token)}, method = ${luaVal(method)}, args = ${luaVal(args)} }\n`;
+  const tmp = path.join(DIR, `cmd.${process.pid}.${Date.now()}.tmp.lua`);
   await fs.writeFile(tmp, chunk, "utf8");
-  try { await fs.access(CMD); await fs.unlink(CMD); } catch {}
-  await fs.rename(tmp, CMD);
+  // atomic-ish handoff with retry (rename fails if another writer won the race)
+  const handoffDeadline = Date.now() + 3000;
+  for (;;) {
+    try { await fs.rename(tmp, CMD); break; }
+    catch (e) {
+      if (e.code !== "EEXIST" && e.code !== "EPERM") throw e;
+      if (Date.now() > handoffDeadline) throw new Error("bridge cmd handoff busy");
+      await sleep(80);
+    }
+  }
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    try {
-      const j = JSON.parse(await fs.readFile(RESP, "utf8"));
-      if (j.id === id) {
-        if (!j.ok) throw new Error("hexchat bridge error: " + j.error);
-        return j.result;
-      }
-    } catch (e) {
-      if (e instanceof SyntaxError || String(e.message).startsWith("hexchat bridge error")) throw e;
+    let j = null;
+    try { j = JSON.parse(await fs.readFile(RESP, "utf8")); } catch { /* torn/partial read, retry */ }
+    if (j && j.id === id) {
+      if (!j.ok) throw new Error("hexchat bridge error: " + j.error);
+      return j.result;
     }
     await sleep(120);
   }
-  throw new Error(`hexchat bridge timeout after ${timeoutMs}ms. Is HexChat running with the hexchat-bridge addon loaded? (Plugins list, or restart HexChat)`);
+  throw new Error(`hexchat bridge timeout after ${timeoutMs}ms. Is HexChat running with the hexchat-bridge addon loaded? (must be connected to a network first)`);
 }
 
 export async function health() {

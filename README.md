@@ -1,20 +1,20 @@
-﻿# hexchat-bridge â€” HexChat agent control bridge
+﻿# hexchat-bridge
 
-Give an AI agent (or a script) **full remote control of a running HexChat IRC
+Give an AI agent (or any script) **full remote control of a running HexChat IRC
 client**: connect to networks, join/part channels, send and receive every
-message, and run any command â€” plus a live, structured log of all IRC traffic.
+message, and run any command - plus a live, structured log of all IRC traffic.
 
 Built for [OpenCode](https://opencode.ai) agents, but the protocol is plain
 files, so anything can drive it.
 
 ```
 agent / shell user
-      â”‚  JSON-RPC over local files (cmd.lua â†’ resp.json)
-      â–¼
-%APPDATA%\HexChat\hexchat-bridge\          â† heartbeat, command queue, event log
-      â–²
-      â”‚  200 ms poll + hooks on ALL server/print events
-HexChat  â—„â”€â”€  addons/hexchat-bridge.lua (Lua addon, no network ports opened)
+      |  token-authenticated JSON-RPC over local files (cmd.lua -> resp.json)
+      v
+%APPDATA%\HexChat\hexchat-bridge\      <- heartbeat, command queue, token, event log
+      ^
+      |  200 ms poll + hooks on ALL server/print events
+HexChat  <-  addons/hexchat-bridge.lua (Lua addon, no network ports opened)
 ```
 
 ## Components
@@ -31,7 +31,7 @@ HexChat  â—„â”€â”€  addons/hexchat-bridge.lua (Lua addon, no netw
 
 ## Install
 
-**1. Bridge addon** â€” copy `addons/hexchat-bridge.lua` into HexChat's config addons dir:
+**1. Bridge addon** - copy `addons/hexchat-bridge.lua` into HexChat's config addons dir:
 
 - Windows: `%APPDATA%\HexChat\addons\hexchat-bridge.lua`
 - Linux: `~/.config/hexchat/addons/hexchat-bridge.lua`
@@ -47,7 +47,7 @@ node client/hexchat.mjs say '{"channel":"#example","text":"hello from an agent"}
 node client/hexchat.mjs events 20 '#example'
 ```
 
-**3b. OpenCode agent usage** â€” copy `opencode-plugin/hexchat.ts` into your
+**3b. OpenCode agent usage** - copy `opencode-plugin/hexchat.ts` into your
 project's `.opencode/plugins/` (or load via `plugins` in `opencode.json`).
 The agent then gets `hexchat_control` and `hexchat_events` tools natively.
 
@@ -55,12 +55,12 @@ The agent then gets `hexchat_control` and `hexchat_events` tools natively.
 
 | Method | Arguments | Effect |
 |---|---|---|
-| `health` | â€” | bridge heartbeat freshness (client-side, no round trip) |
-| `status` | â€” | connected?, networks, channels, nick, users, lag |
-| `servlist` | â€” | saved networks + servers (parsed from `servlist.conf`; password lines are never read) |
-| `buffers` | â€” | open tabs |
+| `health` | - | bridge heartbeat freshness (client-side, no round trip) |
+| `status` | - | connected?, networks, channels, nick, users, lag |
+| `servlist` | - | saved networks + servers (parsed from `servlist.conf`; password lines are never read) |
+| `buffers` | - | open tabs |
 | `users` | `{channel, server?}` | nicklist of a channel |
-| `connect` | `{network}` or `{address, port?, channel?}` | connect (resolves network â†’ first saved server) |
+| `connect` | `{network}` or `{address, port?, channel?}` | connect (resolves network -> first saved server) |
 | `disconnect` | `{network?}` | disconnect |
 | `join` | `{channel, network?, server?, key?, nickserv?, password?}` | join a channel (optionally NickServ-identify) |
 | `part` | `{channel, server?, message?}` | part a channel |
@@ -71,11 +71,26 @@ The agent then gets `hexchat_control` and `hexchat_events` tools natively.
 | `open` | `{network|server, channel}` | open server+channel in a new tab |
 | `close` | `{channel?}` | close a tab |
 | `history` | `{channel?, kind?, limit?}` | in-memory event ring (2000 events) |
-| `clear_history` | â€” | wipe ring + log file |
+| `clear_history` | - | wipe ring + log file |
 
 Event log: every line is appended to `hexchat-bridge/events.jsonl`
 (`kind`: `recv` / `query` / `notice` / `sent` / `join` / `part` / `quit` /
 `nick` / `server`, with `network`, `channel`, `from`, `text`, `t`).
+
+## Security model
+
+The bridge is a **local file RPC** - no network ports. Every command must carry
+a shared secret from `hexchat-bridge/token.txt` (the first client generates it;
+the bridge refuses commands without the right token). What this does and does
+not protect:
+
+- OK: stops other software or users on the machine from blindly driving your
+  IRC identity through the bridge folder
+- NOT OK: malware that can already read your user profile (it can just read the
+  token) - and the `command` method is arbitrary IRC command execution *by design*
+
+Revoke access: delete `token.txt` (a fresh one is generated on the next client
+call) or remove the addon.
 
 ## Known limitations / gotchas
 
@@ -84,25 +99,38 @@ Event log: every line is appended to `hexchat-bridge/events.jsonl`
    loaded yet. Headless launch that works on Windows:
    `hexchat.exe irc.example.net` with the working directory set to the HexChat
    install folder. Once connected, the bridge loads automatically and forever.
-2. **No `/CONNECT` or `/OPEN` commands** in recent HexChat builds â€” the bridge
+2. **No `/CONNECT` or `/OPEN` commands** in recent HexChat builds - the bridge
    maps `connect`/`join` to `/SERVER <addr> [#channel]` via `servlist.conf`.
-3. **Single pending command** at a time (fine for one operator; two agents
-   racing will serialize through the response check).
-4. `events.jsonl` grows unbounded (the RAM ring caps at 2000). Rotate/truncate
-   it yourself or use `clear_history`.
-5. Some server numerics parse with cosmetic quirks (e.g. `JOIN` events keep
-   the channel in `text` rather than `channel`). Raw data is always preserved.
-6. This is a **local** bridge: no sockets, no auth â€” anything that can write
-   files in your profile can drive your IRC client. Don't run it on shared
-   machines.
+3. **Single pending command** at a time (concurrent writers serialize through
+   the handoff retry; there is no queue).
+4. Event log is bounded by rotation to the last ~2000 events; `clear_history`
+   wipes it.
+5. Numeric-reply parsing (`353` etc.) is best-effort; raw data is always
+   preserved in `text`.
 
 ## Development notes (how it was found out)
 - `hclua` requires every script to call `hexchat.register()`.
-- Do **not** copy `hclua.dll` into `addons/` â€” it double-loads the Lua engine
+- Save the addon file as **UTF-8 without BOM** - Lua 5.1 rejects a leading BOM.
+- Do **not** copy `hclua.dll` into `addons/` - it double-loads the Lua engine
   and every command executes twice. The bundled one in the install dir is enough.
 - Boot diagnostics: `<configdir>/hexchat-bridge-boot.log`.
-- To remove: delete `addons/hexchat-bridge.lua`, the `hexchat-bridge/` folder, and
-  `hexchat-bridge-boot.log` from your HexChat config dir.
+- To remove: delete `addons/hexchat-bridge.lua`, the `hexchat-bridge/` folder,
+  and `hexchat-bridge-boot.log` from your HexChat config dir.
+
+## Changelog
+
+**1.0.1**
+- Token-authenticated RPC (was: any local process could drive the client)
+- UTF-8 sanitizer in the JSON encoder - invalid bytes from hostile servers can
+  no longer produce unparseable JSON (parser-crash DoS)
+- Correct pure-Lua `bit_band` fallback (previous one was wrong on Lua 5.1)
+- Command handoff no longer deletes another writer's pending command
+  (unique temp files + rename retry)
+- Event log rotation (was unbounded)
+- Fixed JOIN/numeric channel-field parsing
+- Client: tolerate torn reads of resp.json (retry instead of crash)
+
+**1.0.0** - initial release.
 
 ## License
 GNU Affero General Public License v3.0 or later (AGPL-3.0-or-later).
