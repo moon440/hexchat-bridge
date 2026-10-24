@@ -143,6 +143,12 @@ Revoke everything: delete `token.txt`, or create `PAUSE`, or remove the addon.
 
 ## Changelog
 
+**1.1.1**
+- Outgoing-message capture rewritten at the command layer (`hook_command` for
+  plain input, `/SAY`, `/MSG`) - print-event hooks for sent text proved
+  unreliable on this build; agent and human sends are now always logged
+- `buffers`/`status` no longer mislabel the server pseudo-tab as a channel
+
 **1.1.0**
 - Command protocol is now strict JSON (`cmd.json`) parsed by a built-in
   decoder - the bridge no longer evaluates code-shaped input, and clients

@@ -42,7 +42,7 @@ local function boot(msg)
 end
 boot("chunk start")
 
-hexchat.register("hexchat-bridge", "1.0.2", "HexChat agent control bridge (token RPC + policy safety layer + event log)")
+hexchat.register("hexchat-bridge", "1.1.1", "HexChat agent control bridge (token RPC + policy safety layer + event log)")
 
 local configdir = nil
 pcall(function() configdir = hexchat.get_info("configdir") end)
@@ -55,7 +55,7 @@ boot("configdir=" .. tostring(configdir))
 
 local ok, err = pcall(function()
 
-local VERSION = "1.1.0"
+local VERSION = "1.1.1"
 
 ----------------------------------------------------------------------
 -- JSON encoder (UTF-8 safe: invalid bytes are replaced with U+FFFD so
@@ -246,22 +246,36 @@ hexchat.hook_server(nil, function(word, word_eol)
   })
 end)
 
--- outgoing messages typed in tabs
-local function sent_hook(label)
-  pcall(function()
-    hexchat.hook_print(label, function(word)
-      local c = {}
-      pcall(function() c = hexchat.get_context() or c end)
-      record({
-        t = os.time(), kind = "sent", ev = label,
-        network = c.network or "", channel = c.channel or "",
-        nick = c.nick or "", text = word[1] or "",
-      })
-    end)
-  end)
+-- outgoing message capture at the COMMAND layer (reliable: fires for human-typed
+-- input AND programmatic hexchat.command/ctx:command; print-event hooks proved
+-- unreliable for sent text on this build)
+local function record_sent(target, text)
+  local c = {}
+  pcall(function() c = hexchat.get_context() or c end)
+  if not target or target == "" then target = c.channel or c.tab or "" end
+  record({
+    t = os.time(), kind = "sent",
+    network = c.network or "", channel = target,
+    nick = c.nick or "", text = text or "",
+  })
 end
-sent_hook("Msg Send")
-sent_hook("Private Message to Dialog Sent")
+
+pcall(function()
+  -- plain text typed into a tab (non-command input, includes /say? no: /say is a command)
+  hexchat.hook_command(nil, function(word, word_eol)
+    record_sent(nil, word_eol[1] or "")
+  end)
+end)
+pcall(function()
+  hexchat.hook_command("SAY", function(word, word_eol)
+    record_sent(nil, word_eol[2] or "")
+  end)
+end)
+pcall(function()
+  hexchat.hook_command("MSG", function(word, word_eol)
+    record_sent(word[2], word_eol[3] or "")
+  end)
+end)
 
 ----------------------------------------------------------------------
 -- SAFETY LAYER (defends against a prompt-injected agent as much as
@@ -546,9 +560,12 @@ function M.buffers(a)
   local out = {}
   pcall(function()
     for ch in hexchat.iterate("channels") do
+      -- iterate reports channel==servername for the server pseudo-tab; mark it type=1
+      local name = ch.channel or ""
+      if ch.type == 1 then name = "" end
       out[#out + 1] = {
         network = ch.network or "", server = ch.server or "",
-        channel = ch.channel or "", type = ch.type or 0,
+        channel = name, type = ch.type or 0,
         users = ch.users or 0, flags = ch.flags or 0,
       }
     end
