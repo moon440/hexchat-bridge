@@ -42,7 +42,7 @@ local function boot(msg)
 end
 boot("chunk start")
 
-hexchat.register("hexchat-bridge", "1.1.1", "HexChat agent control bridge (token RPC + policy safety layer + event log)")
+hexchat.register("hexchat-bridge", "1.1.2", "HexChat agent control bridge (token RPC + policy safety layer + event log)")
 
 local configdir = nil
 pcall(function() configdir = hexchat.get_info("configdir") end)
@@ -55,7 +55,7 @@ boot("configdir=" .. tostring(configdir))
 
 local ok, err = pcall(function()
 
-local VERSION = "1.1.1"
+local VERSION = "1.1.2"
 
 ----------------------------------------------------------------------
 -- JSON encoder (UTF-8 safe: invalid bytes are replaced with U+FFFD so
@@ -250,13 +250,23 @@ end)
 -- input AND programmatic hexchat.command/ctx:command; print-event hooks proved
 -- unreliable for sent text on this build)
 local function record_sent(target, text)
-  local c = {}
-  pcall(function() c = hexchat.get_context() or c end)
-  if not target or target == "" then target = c.channel or c.tab or "" end
+  local chan = target
+  if not chan or chan == "" then
+    pcall(function() chan = hexchat.props.channel end) -- props works inside command hooks
+  end
+  if not chan or chan == "" then
+    local c = {}
+    pcall(function() c = hexchat.get_context() or c end)
+    pcall(function() chan = c:get_info("channel") end)
+  end
+  local nick = ""
+  pcall(function() nick = hexchat.get_info("nick") or "" end)
+  local netw = ""
+  pcall(function() netw = hexchat.get_info("network") or "" end)
   record({
     t = os.time(), kind = "sent",
-    network = c.network or "", channel = target,
-    nick = c.nick or "", text = text or "",
+    network = netw, channel = chan or "",
+    nick = nick, text = text or "",
   })
 end
 

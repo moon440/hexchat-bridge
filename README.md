@@ -143,6 +143,12 @@ Revoke everything: delete `token.txt`, or create `PAUSE`, or remove the addon.
 
 ## Changelog
 
+**1.1.2**
+- `sent` events now carry the correct channel when you type in a tab
+  (context object fields were read as properties instead of via
+  `get_info`/`props`, so human-typed messages logged with an empty channel
+  and were invisible to channel filters)
+
 **1.1.1**
 - Outgoing-message capture rewritten at the command layer (`hook_command` for
   plain input, `/SAY`, `/MSG`) - print-event hooks for sent text proved
