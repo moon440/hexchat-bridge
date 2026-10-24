@@ -18,7 +18,7 @@
 
 -- hexchat-bridge -- HexChat file-RPC bridge for external AI agents (OpenCode)
 -- Install: %APPDATA%\HexChat\addons\hexchat-bridge.lua
--- Protocol: client writes cmd.lua (Lua chunk returning {id,method,args}),
+-- Protocol: client writes cmd.json (JSON: {id, token, ts, method, args}),
 --           bridge executes, writes resp.json, heartbeats status.json,
 --           logs all traffic to events.jsonl + in-memory ring.
 -- Boot diagnostics: <configdir>\hexchat-bridge-boot.log
@@ -55,7 +55,7 @@ boot("configdir=" .. tostring(configdir))
 
 local ok, err = pcall(function()
 
-local VERSION = "1.0.2"
+local VERSION = "1.1.0"
 
 ----------------------------------------------------------------------
 -- JSON encoder (UTF-8 safe: invalid bytes are replaced with U+FFFD so
@@ -299,7 +299,8 @@ local function is_paused()
 end
 
 local function verb_blocked(cmdtext)
-  local verb = string.lower(string.match(cmdtext, "^/?([%w_]+)") or "")
+  local t = string.gsub(cmdtext, "^[%s/]+", "") -- normalize leading space/tab/slash
+  local verb = string.lower(string.match(t, "^([%w_]+)") or "")
   for i = 1, #(policy.block_verbs or {}) do
     if policy.block_verbs[i] == verb then return verb end
   end
@@ -336,6 +337,109 @@ end
 -- every mutating method starts with: guard()  (raises on pause)
 local function guard()
   if is_paused() then error("bridge PAUSED (PAUSE file present) - human must delete it or call resume") end
+end
+
+----------------------------------------------------------------------
+-- strict JSON decoder (protocol input is DATA, never code - no loadstring)
+----------------------------------------------------------------------
+local function utf8_cp(cp)
+  if cp < 0x80 then return string.char(cp) end
+  if cp < 0x800 then return string.char(0xC0 + math.floor(cp / 0x40), 0x80 + cp % 0x40) end
+  if cp < 0x10000 then
+    return string.char(0xE0 + math.floor(cp / 0x1000), 0x80 + math.floor(cp / 0x40) % 0x40, 0x80 + cp % 0x40)
+  end
+  return string.char(0xF0 + math.floor(cp / 0x40000), 0x80 + math.floor(cp / 0x1000) % 0x40,
+                     0x80 + math.floor(cp / 0x40) % 0x40, 0x80 + cp % 0x40)
+end
+
+local function json_decode(s)
+  local i = 1
+  local function ws()
+    while i <= #s do
+      local c = s:sub(i, i)
+      if c == " " or c == "\t" or c == "\n" or c == "\r" then i = i + 1 else break end
+    end
+  end
+  local function str()
+    i = i + 1
+    local parts = {}
+    while i <= #s do
+      local c = s:sub(i, i)
+      if c == '"' then i = i + 1 return table.concat(parts) end
+      if c == "\\" then
+        local n = s:sub(i + 1, i + 1)
+        local map = { n = "\n", r = "\r", t = "\t", b = "\b", f = "\f", ["'"] = "/", ['/'] = "/", ['"'] = '"', ["\\"] = "\\" }
+        if n == "u" then
+          local cp = tonumber(s:sub(i + 2, i + 5), 16) or 0xFFFD
+          i = i + 6
+          if cp >= 0xD800 and cp <= 0xDBFF and s:sub(i, i + 1) == "\\u" then
+            local lo = tonumber(s:sub(i + 2, i + 5), 16) or 0
+            if lo >= 0xDC00 and lo <= 0xDFFF then
+              cp = 0x10000 + (cp - 0xD800) * 0x400 + (lo - 0xDC00)
+              i = i + 6
+            end
+          end
+          parts[#parts + 1] = utf8_cp(cp)
+        elseif map[n] then
+          parts[#parts + 1] = map[n]
+          i = i + 2
+        else
+          error("bad escape")
+        end
+      else
+        parts[#parts + 1] = c
+        i = i + 1
+      end
+    end
+    error("unterminated string")
+  end
+  local val
+  function val()
+    ws()
+    local c = s:sub(i, i)
+    if c == "{" then
+      i = i + 1
+      local t = {}
+      ws()
+      if s:sub(i, i) == "}" then i = i + 1 return t end
+      while true do
+        local k = str()
+        ws()
+        if s:sub(i, i) ~= ":" then error("expected :") end
+        i = i + 1
+        local v = val()
+        if v ~= nil then t[k] = v end
+        ws()
+        local d = s:sub(i, i)
+        i = i + 1
+        if d == "}" then return t end
+        if d ~= "," then error("expected , or }") end
+      end
+    elseif c == "[" then
+      i = i + 1
+      local t = {}
+      ws()
+      if s:sub(i, i) == "]" then i = i + 1 return t end
+      while true do
+        t[#t + 1] = val()
+        ws()
+        local d = s:sub(i, i)
+        i = i + 1
+        if d == "]" then return t end
+        if d ~= "," then error("expected , or ]") end
+      end
+    elseif c == '"' then return str()
+    elseif s:sub(i, i + 3) == "true" then i = i + 4 return true
+    elseif s:sub(i, i + 4) == "false" then i = i + 5 return false
+    elseif s:sub(i, i + 3) == "null" then i = i + 4 return nil
+    else
+      local num = string.match(s, "^-?%d+%.?%d*[eE]?[-+]?%d*", i)
+      if not num or num == "" then error("bad value at " .. i) end
+      i = i + #num
+      return tonumber(num)
+    end
+  end
+  return val()
 end
 
 ----------------------------------------------------------------------
@@ -666,23 +770,32 @@ local function poll()
   local ok1, sf = pcall(io.open, bridge_dir .. "status.json", "w")
   if ok1 and sf then sf:write('{"last_poll":' .. tostring(os.time()) .. ',"bridge":"hexchat-bridge"}'); sf:close() end
 
-  local ok2, f = pcall(io.open, bridge_dir .. "cmd.lua", "r")
+  local ok2, f = pcall(io.open, bridge_dir .. "cmd.json", "r")
   if ok2 and f then
-    local data = f:read("*a")
+    local data = f:read(65536) -- hard size cap: no memory spikes from junk files
     f:close()
-    os.remove(bridge_dir .. "cmd.lua")
-    local chunk = data and loadstring(data)
-    if chunk then
-      local ok3, cmd = pcall(chunk)
-      if ok3 and type(cmd) == "table" and cmd.id and cmd.id ~= last_id then
+    os.remove(bridge_dir .. "cmd.json")
+    if data and data ~= "" then
+      local okd, cmd = pcall(json_decode, data)
+      if not okd or type(cmd) ~= "table" then
+        -- malformed input: answer with an error if we can salvage the id
+        local mid = string.match(data, '"id"%s*:%s*"([^"]*)"')
+        if mid then
+          local okw, rf = pcall(io.open, bridge_dir .. "resp.json", "w")
+          if okw and rf then rf:write('{"id":' .. enc_str(mid) .. ',"ok":false,"error":"malformed command json"}'); rf:close() end
+        end
+      elseif cmd.id and cmd.id ~= last_id then
         last_id = cmd.id
         local fn = M[cmd.method]
         local rerr, res = nil, nil
         local expected = read_token()
+        local ts = tonumber(cmd.ts) or 0
         if not expected then
           rerr = "token.txt missing in bridge dir - refusing unauthenticated command"
         elseif cmd.token ~= expected then
           rerr = "invalid token"
+        elseif math.abs(os.time() - ts) > 30 then
+          rerr = "stale or future-dated command (ts skew > 30s) - rejected"
         elseif not fn then
           rerr = "unknown method: " .. tostring(cmd.method)
         else

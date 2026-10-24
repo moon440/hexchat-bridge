@@ -1,7 +1,7 @@
 # never ship local runtime state or personal HexChat data
 events.jsonl
-cmd.lua
-cmd.*.tmp.lua
+cmd.json
+cmd.*.tmp.json
 resp.json
 status.json
 token.txt

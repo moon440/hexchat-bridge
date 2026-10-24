@@ -1,4 +1,4 @@
-﻿# hexchat-bridge
+# hexchat-bridge
 
 Give an AI agent (or any script) **full remote control of a running HexChat IRC
 client**: connect to networks, join/part channels, send and receive every
@@ -9,7 +9,7 @@ files, so anything can drive it.
 
 ```
 agent / shell user
-      |  token-authenticated JSON-RPC over local files (cmd.lua -> resp.json)
+      |  token-authenticated JSON-RPC over local files (cmd.json -> resp.json)
       v
 %APPDATA%\HexChat\hexchat-bridge\      <- heartbeat, command queue, token, event log
       ^
@@ -142,6 +142,16 @@ Revoke everything: delete `token.txt`, or create `PAUSE`, or remove the addon.
   and `hexchat-bridge-boot.log` from your HexChat config dir.
 
 ## Changelog
+
+**1.1.0**
+- Command protocol is now strict JSON (`cmd.json`) parsed by a built-in
+  decoder - the bridge no longer evaluates code-shaped input, and clients
+  got simpler (no escaping layer to maintain)
+- Commands carry a unix timestamp; >30s skew is rejected (no replay of stale
+  queue files after restart)
+- Verb matching normalizes leading whitespace/slashes before policy checks
+- Parse failures answer with an error instead of hanging the client
+- Command files size-capped at 64 KB; tokens and ids from CSPRNG
 
 **1.0.2**
 - Anti-prompt-injection safety layer: `block_verbs` policy (a token-holding but

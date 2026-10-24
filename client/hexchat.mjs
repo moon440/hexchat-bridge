@@ -25,35 +25,17 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
+import crypto from "node:crypto";
 
 const APPDATA = process.env.APPDATA || path.join(os.homedir(), "AppData", "Roaming");
 const DIR = path.join(APPDATA, "HexChat", "hexchat-bridge");
-const CMD = path.join(DIR, "cmd.lua");
+const CMD = path.join(DIR, "cmd.json");
 const RESP = path.join(DIR, "resp.json");
 const STATUS = path.join(DIR, "status.json");
 const EVENTS = path.join(DIR, "events.jsonl");
 const TOKEN = path.join(DIR, "token.txt");
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-function luaVal(v) {
-  if (v === null || v === undefined) return "nil";
-  if (typeof v === "number" || typeof v === "boolean") return String(v);
-  if (typeof v === "string") {
-    let s = v.replace(/\\/g, "\\\\").replace(/"/g, '\\"')
-      .replace(/\n/g, "\\n").replace(/\r/g, "\\r").replace(/\t/g, "\\t");
-    s = s.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, (c) => "\\" + c.charCodeAt(0));
-    return '"' + s + '"';
-  }
-  if (Array.isArray(v)) return "{" + v.map(luaVal).join(",") + "}";
-  if (typeof v === "object") {
-    const parts = Object.entries(v).filter(([, x]) => x !== undefined)
-      .map(([k, x]) => luaKey(k) + " = " + luaVal(x));
-    return "{" + parts.join(", ") + "}";
-  }
-  return "nil";
-}
-const luaKey = (k) => (/^[A-Za-z_][A-Za-z0-9_]*$/.test(k) ? k : "[" + luaVal(k) + "]");
 
 async function ensureDir() { await fs.mkdir(DIR, { recursive: true }); }
 
@@ -65,8 +47,7 @@ async function getToken() {
     const t = (await fs.readFile(TOKEN, "utf8")).trim();
     if (t) return t;
   } catch {}
-  const t = "hcb-" + Date.now().toString(36) + "-" +
-    Math.random().toString(36).slice(2, 10) + Math.random().toString(36).slice(2, 10);
+  const t = crypto.randomBytes(24).toString("hex");
   try { await fs.writeFile(TOKEN, t, "utf8"); } catch {}
   return t;
 }
@@ -74,10 +55,10 @@ async function getToken() {
 export async function call(method, args = {}, timeoutMs = 15000) {
   await ensureDir();
   const token = await getToken();
-  const id = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
-  const chunk = `return { id = ${luaVal(id)}, token = ${luaVal(token)}, method = ${luaVal(method)}, args = ${luaVal(args)} }\n`;
-  const tmp = path.join(DIR, `cmd.${process.pid}.${Date.now()}.tmp.lua`);
-  await fs.writeFile(tmp, chunk, "utf8");
+  const id = crypto.randomBytes(8).toString("hex");
+  const body = JSON.stringify({ id, token, ts: Math.floor(Date.now() / 1000), method, args });
+  const tmp = path.join(DIR, `cmd.${process.pid}.${Date.now()}.tmp.json`);
+  await fs.writeFile(tmp, body, "utf8");
   // atomic-ish handoff with retry (rename fails if another writer won the race)
   const handoffDeadline = Date.now() + 3000;
   for (;;) {
