@@ -42,7 +42,7 @@ local function boot(msg)
 end
 boot("chunk start")
 
-hexchat.register("hexchat-bridge", "1.0.1", "HexChat agent control bridge (token-authenticated file RPC + event log)")
+hexchat.register("hexchat-bridge", "1.0.2", "HexChat agent control bridge (token RPC + policy safety layer + event log)")
 
 local configdir = nil
 pcall(function() configdir = hexchat.get_info("configdir") end)
@@ -54,6 +54,8 @@ local bridge_dir = configdir .. "\\hexchat-bridge\\"
 boot("configdir=" .. tostring(configdir))
 
 local ok, err = pcall(function()
+
+local VERSION = "1.0.2"
 
 ----------------------------------------------------------------------
 -- JSON encoder (UTF-8 safe: invalid bytes are replaced with U+FFFD so
@@ -262,6 +264,81 @@ sent_hook("Msg Send")
 sent_hook("Private Message to Dialog Sent")
 
 ----------------------------------------------------------------------
+-- SAFETY LAYER (defends against a prompt-injected agent as much as
+-- against rogue local processes; policy file is human-editable and
+-- cached at load - reload with the reload_policy method)
+----------------------------------------------------------------------
+local policy_file = configdir .. "\\hexchat-bridge-policy.lua"
+
+local policy = {
+  block_verbs = { "exec", "luaexec", "luareload", "luaconsole", "luareset",
+                  "load", "unload", "stop", "dcc", "url", "gui" },
+  allow_send_channels = nil,   -- nil = unrestricted; else { "#chan", "nick", ... }
+  max_msgs_per_min = 25,       -- token-bucket for say/command
+  max_per_sec = 2,             -- burst cap (also reads as human pacing)
+}
+
+local function load_policy()
+  local okf, f = pcall(io.open, policy_file, "r")
+  if not okf or not f then return end
+  local data = f:read("*a"); f:close()
+  local chunk = data and loadstring(data)
+  if chunk then
+    local okr, user = pcall(chunk)
+    if okr and type(user) == "table" then
+      for k, v in pairs(user) do policy[k] = v end
+    end
+  end
+end
+load_policy()
+
+local function is_paused()
+  local ok, f = pcall(io.open, bridge_dir .. "PAUSE", "r")
+  if ok and f then f:close(); return true end
+  return false
+end
+
+local function verb_blocked(cmdtext)
+  local verb = string.lower(string.match(cmdtext, "^/?([%w_]+)") or "")
+  for i = 1, #(policy.block_verbs or {}) do
+    if policy.block_verbs[i] == verb then return verb end
+  end
+  return nil
+end
+
+local send_times = {}
+local function rate_gate()
+  local now = os.time()
+  while #send_times > 0 and now - send_times[1] >= 60 do table.remove(send_times, 1) end
+  if #send_times >= (policy.max_msgs_per_min or 25) then
+    return false, "rate limit: max_msgs_per_min reached"
+  end
+  local recent = 0
+  for i = #send_times, 1, -1 do
+    if now - send_times[i] < 1 then recent = recent + 1 else break end
+  end
+  if recent >= (policy.max_per_sec or 2) then
+    return false, "send pacing: max_per_sec reached (wait ~1s)"
+  end
+  send_times[#send_times + 1] = now
+  return true
+end
+
+local function sendable(channel)
+  if not policy.allow_send_channels then return true end
+  local lc = string.lower(channel or "")
+  for i = 1, #policy.allow_send_channels do
+    if string.lower(policy.allow_send_channels[i]) == lc then return true end
+  end
+  return false
+end
+
+-- every mutating method starts with: guard()  (raises on pause)
+local function guard()
+  if is_paused() then error("bridge PAUSED (PAUSE file present) - human must delete it or call resume") end
+end
+
+----------------------------------------------------------------------
 -- helpers
 ----------------------------------------------------------------------
 local function run_in(a, cmdtext)
@@ -279,8 +356,10 @@ local function run_in(a, cmdtext)
 end
 
 local function escape_arg(s)
-  -- minimal guard against command injection into /exec-like parsing
-  return (string.gsub(s, "[\r\n]", " "))
+  -- guard against command injection: no newlines (command split), no NUL (truncation).
+  -- NOTE: a literal \0 inside a Lua 5.1 pattern is INVALID (pattern truncates at NUL);
+  -- the correct class for a zero byte is %z.
+  return (string.gsub(s, "[\r\n]", " "):gsub("%z", " "))
 end
 
 ----------------------------------------------------------------------
@@ -325,7 +404,12 @@ function M.ping(a)
 end
 
 function M.status(a)
-  local out = { connected = false, networks = {}, channels = {}, nick = hexchat.get_info("nick") or "" }
+  local out = { connected = false, networks = {}, channels = {},
+                nick = hexchat.get_info("nick") or "",
+                paused = is_paused(),
+                policy = { max_msgs_per_min = policy.max_msgs_per_min,
+                           max_per_sec = policy.max_per_sec,
+                           allow_send_channels = policy.allow_send_channels } }
   pcall(function()
     for ch in hexchat.iterate("channels") do
       local flags = ch.flags or 0
@@ -383,6 +467,7 @@ function M.users(a)
 end
 
 function M.connect(a)
+  guard()
   if a and a.address and a.address ~= "" then
     hexchat.command("SERVER " .. escape_arg(a.address) .. (a.port and (" " .. tostring(a.port)) or "") .. (a.channel and (" " .. escape_arg(a.channel)) or ""))
   elseif a and a.network and a.network ~= "" then
@@ -396,6 +481,7 @@ function M.connect(a)
 end
 
 function M.disconnect(a)
+  guard()
   if a and a.network then
     local ctx = nil
     pcall(function() ctx = hexchat.find_context(a.network, nil) end)
@@ -435,6 +521,7 @@ function M.close(a)
 end
 
 function M.join(a)
+  guard()
   if not a or not a.channel then error("join needs args.channel") end
   local joined_ctx = false
   if a.network and a.network ~= "" then
@@ -459,13 +546,18 @@ function M.join(a)
 end
 
 function M.part(a)
+  guard()
   if not a or not a.channel then error("part needs args.channel") end
   run_in({ server = a.server, channel = a.channel }, "PART " .. escape_arg(a.channel) .. (a.message and (" :" .. escape_arg(a.message)) or ""))
   return { sent = true }
 end
 
 function M.say(a)
+  guard()
   if not a or not a.channel or a.text == nil then error("say needs args.channel and args.text") end
+  if not sendable(a.channel) then error("policy: channel not in allow_send_channels: " .. a.channel) end
+  local ok2, why = rate_gate()
+  if not ok2 then error("policy: " .. why) end
   run_in({ server = a.server, channel = a.channel }, "MSG " .. escape_arg(a.channel) .. " " .. escape_arg(a.text))
   return { sent = true }
 end
@@ -473,7 +565,12 @@ end
 M.msg = M.say
 
 function M.command(a)
+  guard()
   if not a or not a.cmd then error("command needs args.cmd") end
+  local blocked = verb_blocked(a.cmd)
+  if blocked then error("policy: verb blocked: /" .. blocked .. " (edit hexchat-bridge-policy.lua to allow)") end
+  local ok2, why = rate_gate()
+  if not ok2 then error("policy: " .. why) end
   run_in(a, escape_arg(a.cmd))
   return { sent = true }
 end
@@ -481,6 +578,7 @@ end
 M.raw = M.command
 
 function M.nick(a)
+  guard()
   if not a or not a.nick then error("nick needs args.nick") end
   hexchat.command("NICK " .. escape_arg(a.nick))
   return { sent = true }
@@ -519,6 +617,34 @@ function M.clear_history(a)
   local ok2, f = pcall(io.open, bridge_dir .. "events.jsonl", "w")
   if ok2 and f then f:close() end
   return { cleared = true }
+end
+
+----------------------------------------------------------------------
+-- safety control methods (never guarded - they ARE the controls)
+----------------------------------------------------------------------
+function M.pause(a)
+  local ok2, f = pcall(io.open, bridge_dir .. "PAUSE", "w")
+  if not ok2 or not f then error("cannot create PAUSE file") end
+  f:write("paused via RPC " .. tostring(os.time())); f:close()
+  return { paused = true }
+end
+
+function M.resume(a)
+  os.remove(bridge_dir .. "PAUSE")
+  return { paused = is_paused() }
+end
+
+function M.reload_policy(a)
+  policy = {
+    block_verbs = { "exec", "luaexec", "luareload", "luaconsole", "luareset",
+                    "load", "unload", "stop", "dcc", "url", "gui" },
+    allow_send_channels = nil,
+    max_msgs_per_min = 25,
+    max_per_sec = 2,
+  }
+  load_policy()
+  return { reloaded = true, max_msgs_per_min = policy.max_msgs_per_min,
+           allow_send_channels = policy.allow_send_channels }
 end
 
 ----------------------------------------------------------------------
@@ -578,8 +704,8 @@ local function poll()
 end
 
 hexchat.hook_timer(200, poll)
-record({ t = os.time(), kind = "system", text = "hexchat-bridge 1.0.1 loaded dir=" .. bridge_dir })
-boot("hexchat-bridge 1.0.1 main() complete")
+record({ t = os.time(), kind = "system", text = "hexchat-bridge " .. VERSION .. " loaded dir=" .. bridge_dir })
+boot("hexchat-bridge " .. VERSION .. " main() complete")
 
 end)
 

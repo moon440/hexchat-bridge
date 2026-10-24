@@ -5,6 +5,8 @@ cmd.*.tmp.lua
 resp.json
 status.json
 token.txt
+PAUSE
+hexchat-bridge-policy.lua
 hexchat-bridge-boot.log
 servlist.conf
 hexchat.conf
